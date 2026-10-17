@@ -6869,154 +6869,114 @@ window.renderCharactersPage = function() {
   `;
 };
 
-// ================= Progressive Image Loader & Poster Cache Manager =================
-// Improved queue: bounded concurrency, timeout recovery, duplicate protection.
-window.posterCache = window.posterCache || new Set();
-window._activePosterLoads = 0;
-window._maxConcurrentPosterLoads = 10;
-window._posterLoadQueue = window._posterLoadQueue || [];
-window._posterLoadingSet = window._posterLoadingSet || new Set();
-window._posterTimeouts = window._posterTimeouts || new WeakMap();
-
-window.enqueuePosterLoad = function(img) {
-  if (!img || !img.isConnected) return;
-  const targetSrc = img.getAttribute('data-src') || '';
-  if (!targetSrc) return;
-  if (img.dataset.posterLoading === '1' || img.dataset.posterDone === '1') return;
-  if (window.posterCache.has(targetSrc)) {
-    img.onload = null; img.onerror = null;
-    img.src = targetSrc;
-    img.classList.add('loaded');
-    img.dataset.posterDone = '1';
-    const ph = img.parentElement?.querySelector('.poster-placeholder-skeleton');
-    if (ph) ph.classList.add('hidden');
-    return;
+// ================= High-Performance Poster Cache & Preload Manager =================
+// 1. Persistent cache registry loaded from localStorage across app launches
+window._posterMemoryCache = new Set();
+try {
+  const saved = localStorage.getItem("black_anime_cached_posters");
+  if (saved) {
+    const list = JSON.parse(saved);
+    if (Array.isArray(list)) list.forEach(u => window._posterMemoryCache.add(u));
   }
-  if (!window._posterLoadQueue.includes(img)) window._posterLoadQueue.push(img);
-  window.processPosterQueue();
-};
+} catch(e) {}
 
-window.processPosterQueue = function() {
-  while (window._activePosterLoads < window._maxConcurrentPosterLoads && window._posterLoadQueue.length) {
-    const img = window._posterLoadQueue.shift();
-    if (!img || !img.isConnected) continue;
-    const targetSrc = img.getAttribute('data-src');
-    if (!targetSrc || img.dataset.posterLoading === '1' || img.dataset.posterDone === '1') continue;
-    img.dataset.posterLoading = '1';
-    img.dataset.posterRetry = img.dataset.posterRetry || '0';
-    window._activePosterLoads++;
-    window._posterLoadingSet.add(img);
-    let finished = false;
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      const timer = window._posterTimeouts.get(img);
-      if (timer) clearTimeout(timer);
-      window._posterTimeouts.delete(img);
-      if (window._posterLoadingSet.has(img)) {
-        window._posterLoadingSet.delete(img);
-        window._activePosterLoads = Math.max(0, window._activePosterLoads - 1);
-      }
-      img.dataset.posterLoading = '0';
-      window.processPosterQueue();
-    };
-    img.onload = function() {
-      finish();
-      if (img.naturalWidth > 0) {
-        const url = img.getAttribute('data-src') || img.src;
-        if (url) window.posterCache.add(url);
-        img.dataset.posterDone = '1';
-        img.classList.add('loaded');
-        img.classList.remove('fallback-applied');
-        const ph = img.parentElement?.querySelector('.poster-placeholder-skeleton');
-        if (ph) ph.classList.add('hidden');
-      } else { window.onPosterError(img); }
-    };
-    img.onerror = function() {
-      finish();
-      if (img.dataset.posterRetry !== '1' && img.isConnected) {
-        img.dataset.posterRetry = '1';
-        // One retry with a cache-busting parameter can recover transient CDN failures.
-        const url = img.getAttribute('data-src');
-        if (url && /^https?:/i.test(url)) {
-          const retryUrl = url + (url.includes('?') ? '&' : '?') + '_poster_retry=1';
-          img.setAttribute('data-retry-src', retryUrl);
-          img.dataset.posterDone = '0';
-          window._posterLoadQueue.unshift(img);
-          img.setAttribute('data-src', retryUrl);
-          window.processPosterQueue();
-          return;
-        }
-      }
-      window.onPosterError(img);
-    };
-    window._posterTimeouts.set(img, setTimeout(() => {
-      if (finished) return;
-      finish();
-      if (img.dataset.posterRetry !== '1') {
-        img.dataset.posterRetry = '1';
-        window._posterLoadQueue.unshift(img);
-        window.processPosterQueue();
-      } else window.onPosterError(img);
-    }, 15000));
-    img.src = targetSrc;
+// Backward compatibility with previous references
+window.posterCache = window._posterMemoryCache;
+
+window._posterSaveTimeout = null;
+window.markPosterCached = function(url) {
+  if (!url || typeof url !== "string") return;
+  const clean = url.trim();
+  if (!clean || clean.startsWith("data:")) return;
+  if (!window._posterMemoryCache.has(clean)) {
+    window._posterMemoryCache.add(clean);
+    if (!window._posterSaveTimeout) {
+      window._posterSaveTimeout = setTimeout(() => {
+        window._posterSaveTimeout = null;
+        try {
+          const arr = Array.from(window._posterMemoryCache).slice(-1200);
+          localStorage.setItem("black_anime_cached_posters", JSON.stringify(arr));
+        } catch(e) {}
+      }, 1500);
+    }
   }
 };
+
+window.isPosterCached = function(url) {
+  if (!url || typeof url !== "string") return false;
+  return window._posterMemoryCache.has(url.trim());
+};
+
+// Fallback branded SVG banner (preserving 2:3 ratio, elegant animation branding)
+window.POSTER_FALLBACK_SVG = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='450' viewBox='0 0 300 450'><rect width='100%' height='100%' fill='%23141419'/><rect x='10' y='10' width='280' height='430' rx='12' fill='%231b1b22' stroke='%23333340' stroke-width='2'/><circle cx='150' cy='200' r='48' fill='%23252530'/><text x='150' y='215' font-size='42' text-anchor='middle' fill='%23666677'>🎬</text><text x='150' y='275' font-family='sans-serif' font-size='14' font-weight='bold' text-anchor='middle' fill='%23888899'>عالم الأنمي</text></svg>";
 
 window.onPosterLoaded = function(img) {
   if (!img) return;
-  // Handles images loaded directly (e.g. details/admin screens) as well as queued images.
-  const targetSrc = img.getAttribute('data-src') || img.currentSrc || img.src;
-  if (targetSrc && img.naturalWidth > 0) window.posterCache.add(targetSrc);
-  img.classList.add('loaded');
-  img.dataset.posterDone = '1';
-  const ph = img.parentElement?.querySelector('.poster-placeholder-skeleton');
-  if (ph) ph.classList.add('hidden');
-  if (window._posterLoadingSet.has(img)) {
-    window._posterLoadingSet.delete(img);
-    window._activePosterLoads = Math.max(0, window._activePosterLoads - 1);
-    const timer = window._posterTimeouts.get(img);
-    if (timer) clearTimeout(timer);
-    window._posterTimeouts.delete(img);
-    img.dataset.posterLoading = '0';
-    window.processPosterQueue();
+  const url = (img.currentSrc || img.src || "").trim();
+  if (url && !url.startsWith("data:")) {
+    window.markPosterCached(url);
   }
+  img.classList.add("loaded");
+  img.classList.remove("fallback-applied");
+  const ph = img.parentElement ? img.parentElement.querySelector(".poster-placeholder-skeleton") : null;
+  if (ph) ph.classList.add("hidden");
 };
 
-window.onPosterError = function(img) {
+window.onPosterError = function(img, origUrl) {
   if (!img) return;
-  if (window._posterLoadingSet.has(img)) {
-    window._posterLoadingSet.delete(img);
-    window._activePosterLoads = Math.max(0, window._activePosterLoads - 1);
+  const targetUrl = origUrl || img.dataset.src || img.src || "";
+  let retries = Number(img.dataset.retries || 0);
+
+  // Transient network error recovery: retry with short backoff up to 2 times
+  if (retries < 2 && targetUrl && /^https?:/i.test(targetUrl)) {
+    img.dataset.retries = String(retries + 1);
+    const delay = retries === 0 ? 1000 : 2500;
+    setTimeout(() => {
+      if (!img.isConnected) return;
+      const retryUrl = targetUrl + (targetUrl.includes("?") ? "&" : "?") + "_r=" + (retries + 1);
+      img.src = retryUrl;
+    }, delay);
+    return;
   }
-  const timer = window._posterTimeouts.get(img);
-  if (timer) clearTimeout(timer);
-  window._posterTimeouts.delete(img);
-  img.dataset.posterLoading = '0';
-  const fallbackSvg = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='450' viewBox='0 0 300 450'><rect width='100%' height='100%' fill='%23141419'/><rect x='10' y='10' width='280' height='430' rx='12' fill='%231b1b22' stroke='%23333340' stroke-width='2'/><circle cx='150' cy='200' r='48' fill='%23252530'/><text x='150' y='215' font-size='42' text-anchor='middle' fill='%23666677'>🎬</text><text x='150' y='275' font-family='sans-serif' font-size='14' font-weight='bold' text-anchor='middle' fill='%23888899'>عالم الأنمي</text></svg>";
+
+  // Final fallback if permanent failure or exhausted retries
   img.onerror = null;
-  img.src = fallbackSvg;
-  img.dataset.posterDone = '1';
-  img.classList.add('loaded', 'fallback-applied');
-  const ph = img.parentElement?.querySelector('.poster-placeholder-skeleton');
-  if (ph) ph.classList.add('hidden');
-  window.processPosterQueue();
+  img.src = window.POSTER_FALLBACK_SVG;
+  img.classList.add("loaded", "fallback-applied");
+  const ph = img.parentElement ? img.parentElement.querySelector(".poster-placeholder-skeleton") : null;
+  if (ph) ph.classList.add("hidden");
 };
 
-window.initPosterObserver = function() {
-  if (window._posterObserver) return;
-  if (typeof IntersectionObserver !== 'undefined') {
-    window._posterObserver = new IntersectionObserver((entries, observer) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting) {
-          observer.unobserve(entry.target);
-          window.enqueuePosterLoad(entry.target);
-        }
-      });
-    }, { rootMargin: '500px 0px', threshold: 0.01 });
+// Smart Preload Helper: Preloads upcoming posters in background without blocking UI
+window.preloadPosters = function(items, count = 12) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const candidates = items.slice(0, count);
+  const runPreload = () => {
+    candidates.forEach((it, idx) => {
+      const url = (it && (it.poster || it.image || "")) ? (it.poster || it.image).trim() : "";
+      if (url && /^https?:/i.test(url) && !window._posterMemoryCache.has(url)) {
+        setTimeout(() => {
+          const pre = new Image();
+          pre.decoding = "async";
+          pre.src = url;
+          pre.onload = () => window.markPosterCached(url);
+        }, idx * 60);
+      }
+    });
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(runPreload, { timeout: 2000 });
+  } else {
+    setTimeout(runPreload, 100);
   }
 };
-window.initPosterObserver();
+
+window.enqueuePosterLoad = function(img) {
+  if (!img) return;
+  if (img.complete && img.naturalWidth > 0) {
+    window.onPosterLoaded(img);
+  }
+};
 
 // ================= Progressive Document Parsing & Ordering =================
 window.parseMovieDoc = function(d) {
@@ -7073,16 +7033,7 @@ try {
 window.createCardElement = function(item) {
   const wrapper = document.createElement("div");
   wrapper.innerHTML = window.createCard(item).trim();
-  const el = wrapper.firstElementChild;
-  const img = el ? el.querySelector("img.poster") : null;
-  if (img) {
-    if (window._posterObserver) {
-      window._posterObserver.observe(img);
-    } else {
-      window.enqueuePosterLoad(img);
-    }
-  }
-  return el;
+  return wrapper.firstElementChild;
 };
 
 window.updateCardElement = function(cardEl, item) {
@@ -7094,15 +7045,16 @@ window.updateCardElement = function(cardEl, item) {
   }
   const img = cardEl.querySelector("img.poster");
   const newPoster = (item.poster || "").trim();
-  if (img && img.getAttribute("data-src") !== newPoster) {
-    img.setAttribute("data-src", newPoster);
+  if (img && img.src !== newPoster) {
+    img.src = newPoster;
+    const isCached = window.isPosterCached(newPoster);
     const ph = cardEl.querySelector(".poster-placeholder-skeleton");
-    if (ph) ph.classList.remove("hidden");
-    img.classList.remove("loaded", "fallback-applied");
-    if (window._posterObserver) {
-      window._posterObserver.observe(img);
+    if (isCached) {
+      img.classList.add("loaded");
+      if (ph) ph.classList.add("hidden");
     } else {
-      window.enqueuePosterLoad(img);
+      img.classList.remove("loaded", "fallback-applied");
+      if (ph) ph.classList.remove("hidden");
     }
   }
   const posterWrap = cardEl.querySelector(".poster-wrapper");
@@ -7176,6 +7128,7 @@ window.setupMoviesListener = function() {
       const parsedItems = s.docs.map(window.parseMovieDoc);
       parsedItems.sort(window.compareMoviesOrder);
       window.allContent = parsedItems;
+      window.preloadPosters(parsedItems, 20);
 
       try {
         localStorage.setItem("movies_offline_cache", JSON.stringify(parsedItems.slice(0, 100)));
@@ -7333,7 +7286,7 @@ window.createCard = (item) => {
   let year = item.year || 2024;
   let metaText = `${year} • ${metaCategory}`;
   let posterUrl = (item.poster || "https://images.unsplash.com/photo-1536240478700-b869070f9279?w=400").trim();
-  let isCached = window.posterCache && window.posterCache.has(posterUrl);
+  let isCached = window.isPosterCached(posterUrl);
 
   return `
     <div class="movie-card progressive-item-enter" data-card-fid="${item.firebaseId}" tabindex="0" onclick="${click}">
@@ -7342,17 +7295,15 @@ window.createCard = (item) => {
         ${del}
         <div class="poster-placeholder-skeleton ${isCached ? 'hidden' : ''}">
           <span class="poster-placeholder-icon">🎬</span>
-          <span class="poster-placeholder-text">جاري تحميل البوستر...</span>
         </div>
         <img class="poster ${isCached ? 'loaded' : ''}" 
              data-poster-fid="${item.firebaseId}" 
-             data-src="${posterUrl}" 
-             src="${isCached ? posterUrl : 'data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'15\'></svg>'}" 
+             src="${posterUrl}" 
              alt="${window.escapeDescHtml(item.title || '')}" 
              loading="lazy" 
              decoding="async" 
              onload="window.onPosterLoaded(this)" 
-             onerror="window.onPosterError(this)">
+             onerror="window.onPosterError(this, '${posterUrl}')">
         <span class="poster-red-badge">${window.escapeDescHtml(redBadge)}</span>
         ${versionBadgeHtml}
         ${window.getItemRatingBadgeHtml(item)}
@@ -7470,9 +7421,10 @@ window.renderHome = () => {
     let catLabel = item.category || (isAnimation ? "أنميشن" : "مسلسل");
     let landscapeImg = window.getItemLandscapePoster(item);
     let fallbackImg = (item.poster || "").trim();
+    let isFirst = idx === 0;
     return `
       <div class="hero-slide ${idx === 0 ? 'active' : ''}" onclick="openDetails('${item.firebaseId}')">
-        <img class="hero-slide-img" src="${landscapeImg}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" onerror="this.onerror=null;this.src='${fallbackImg}'">
+        <img class="hero-slide-img" src="${landscapeImg}" alt="${window.escapeDescHtml(item.title)}" loading="${isFirst ? 'eager' : 'lazy'}" ${isFirst ? 'fetchpriority="high"' : ''} onerror="this.onerror=null;this.src='${fallbackImg}'">
         <div class="hero-slide-overlay">
           <span class="hero-slide-tag">${window.escapeDescHtml(catLabel)}</span>
           <h2 class="hero-slide-title">${window.escapeDescHtml(item.title)}</h2>
@@ -7500,14 +7452,14 @@ window.renderHome = () => {
     let isAnimation = item.type === "animation" || item.type === "arabic" || item.type === "sports";
     let catLabel = item.category || (isAnimation ? "أنميشن" : "مسلسل");
     let posterUrl = (item.poster || "").trim();
-    let isCached = window.posterCache && window.posterCache.has(posterUrl);
+    let isCached = window.isPosterCached(posterUrl);
     return `
       <div class="home-content-card progressive-item-enter" data-card-fid="${item.firebaseId}" onclick="openDetails('${item.firebaseId}')">
         <div class="home-card-poster-wrap">
           <div class="poster-placeholder-skeleton ${isCached ? 'hidden' : ''}">
             <span class="poster-placeholder-icon" style="font-size:20px">🎬</span>
           </div>
-          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" data-src="${posterUrl}" src="${isCached ? posterUrl : 'data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'15\'></svg>'}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this)">
+          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" src="${posterUrl}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this, '${posterUrl}')">
           <span class="home-card-badge">${window.escapeDescHtml(epBadge)}</span>
           ${window.getItemRatingBadgeHtml(item)}
         </div>
@@ -7523,14 +7475,14 @@ window.renderHome = () => {
     let isAnimation = item.type === "animation" || item.type === "arabic" || item.type === "sports";
     let catLabel = item.category || (isAnimation ? "أنميشن" : "مسلسل");
     let posterUrl = (item.poster || "").trim();
-    let isCached = window.posterCache && window.posterCache.has(posterUrl);
+    let isCached = window.isPosterCached(posterUrl);
     return `
       <div class="home-content-card progressive-item-enter" data-card-fid="${item.firebaseId}" onclick="openDetails('${item.firebaseId}')">
         <div class="home-card-poster-wrap">
           <div class="poster-placeholder-skeleton ${isCached ? 'hidden' : ''}">
             <span class="poster-placeholder-icon" style="font-size:20px">🎬</span>
           </div>
-          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" data-src="${posterUrl}" src="${isCached ? posterUrl : 'data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'15\'></svg>'}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this)">
+          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" src="${posterUrl}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this, '${posterUrl}')">
           <span class="home-card-badge" style="background:rgba(0,180,240,0.92);color:#000;font-weight:900">${item.year || 2024}</span>
           ${window.getItemRatingBadgeHtml(item)}
         </div>
@@ -7567,7 +7519,7 @@ window.renderHome = () => {
       rankText = `#${idx + 1}`;
     }
     let posterUrl = (item.poster || "").trim();
-    let isCached = window.posterCache && window.posterCache.has(posterUrl);
+    let isCached = window.isPosterCached(posterUrl);
 
     return `
       <div class="home-content-card progressive-item-enter" data-card-fid="${item.firebaseId}" onclick="openDetails('${item.firebaseId}')">
@@ -7575,7 +7527,7 @@ window.renderHome = () => {
           <div class="poster-placeholder-skeleton ${isCached ? 'hidden' : ''}">
             <span class="poster-placeholder-icon" style="font-size:20px">🎬</span>
           </div>
-          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" data-src="${posterUrl}" src="${isCached ? posterUrl : 'data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'10\' height=\'15\'></svg>'}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this)">
+          <img class="poster ${isCached ? 'loaded' : ''}" data-poster-fid="${item.firebaseId}" src="${posterUrl}" alt="${window.escapeDescHtml(item.title)}" loading="lazy" decoding="async" onload="window.onPosterLoaded(this)" onerror="window.onPosterError(this, '${posterUrl}')">
           <span class="home-card-rank-badge" style="${rankBadgeStyle}">${rankText}</span>
           ${window.getItemRatingBadgeHtml(item)}
         </div>
@@ -7661,6 +7613,7 @@ window.renderHome = () => {
   setActiveNav("home");
   window.setupHeroSliderTouch();
   window.startHeroSlideAutoPlay();
+  window.preloadPosters(all, 20);
 };
 window.renderCategory=(type)=>{
   let isAnimation = type === "animation" || type === "arabic" || type === "sports";
